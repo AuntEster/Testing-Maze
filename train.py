@@ -1,47 +1,70 @@
-
-from __future__ import annotations
-
 import argparse
 
-from agent import FreshMazeAgent
 from core import MazeEnvironment
+from agent import MazeAgent
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--maze", default="/mnt/data/MAZE_1.png")
+    parser.add_argument("--maze", default="maze-alpha/MAZE_1.png")
     parser.add_argument("--templates", default="templates")
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--max-turns", type=int, default=10_000)
     parser.add_argument("--rotate-fire", action="store_true")
-    parser.add_argument("--save", default="fresh_agent.pkl")
+    parser.add_argument("--save", default="agent.pkl")
     args = parser.parse_args()
 
-    env = MazeEnvironment(args.maze, templates_dir=args.templates, rotate_fire=args.rotate_fire)
-    agent = FreshMazeAgent()
-    agent.attach_environment(env)
+    env = MazeEnvironment(
+        args.maze,
+        templates_dir=args.templates,
+        rotate_fire=args.rotate_fire,
+    )
+
+    agent = MazeAgent()
+    agent.env = env
 
     successes = 0
-    for ep in range(1, args.episodes + 1):
-        start = env.reset()
-        agent.reset_episode(start)
+
+    for ep in range(args.episodes):
+        pos = env.reset()
+        agent.current_pos = pos
+        agent.start_pos = pos
+        agent.goal_pos = env.goal_cell
+        agent.reset_episode()
         last_result = None
 
-        for turn in range(1, args.max_turns + 1):
+        for turn in range(args.max_turns):
+            old_pos = agent.current_pos
+            old_state = agent.state()
+
             actions = agent.plan_turn(last_result)
-            last_result = env.step(actions)
-            if last_result.is_goal_reached:
+            result = env.step(actions)
+
+            reward = agent.compute_reward(result, old_pos)
+            new_state = agent.state()
+            agent.update_q(old_state, actions[0], reward, new_state)
+
+            last_result = result
+
+            if result.is_goal_reached:
                 successes += 1
                 print(
-                    f"Ep {ep:>3}: SUCCESS in {turn:>5} turns | "
-                    f"known={len(agent.known_cells)} | wins={successes}"
+                    f"Ep {ep+1:>3}: SUCCESS in {turn+1:>5} turns | "
+                    f"ε={agent.epsilon:.3f} | "
+                    f"known={len(agent.known)} cells | "
+                    f"cumulative wins={successes}"
                 )
                 break
-        else:
-            print(f"Ep {ep:>3}: timeout          | known={len(agent.known_cells)}")
+
+            if turn == args.max_turns - 1:
+                print(
+                    f"Ep {ep+1:>3}: timeout          | "
+                    f"ε={agent.epsilon:.3f} | "
+                    f"known={len(agent.known)} cells"
+                )
 
     agent.save(args.save)
-    print(f"Saved trained agent to {args.save}")
+    print(f"\nTraining complete. Total successes: {successes}/{args.episodes}")
 
 
 if __name__ == "__main__":

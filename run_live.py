@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import time
 
-from agent import FreshMazeAgent
+from agent import MazeAgent
 from core import MazeEnvironment
 from visualize import LiveVisualizer
 
@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
 
     env = MazeEnvironment(args.maze, templates_dir=args.templates, rotate_fire=args.rotate_fire)
-    agent = FreshMazeAgent()
+    agent = MazeAgent()
     agent.attach_environment(env)
     agent.load(args.model)
 
