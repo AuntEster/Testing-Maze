@@ -1,98 +1,77 @@
-import sys
-from hazardDemo import MazeEnvironment
-from agent import MazeAgent
+
+from __future__ import annotations
+
+import argparse
+import time
+
+from agent import FreshMazeAgent
+from core import MazeEnvironment
 from visualize import LiveVisualizer
 
-MAZE_PATH    = sys.argv[1] if len(sys.argv) > 1 else "maze-alpha/MAZE_1.png"
-NUM_EPISODES = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-UPDATE_EVERY = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-MAX_TURNS    = 10_000
-DEBUG_HAZARDS = (len(sys.argv) > 5 and sys.argv[5].lower() in {"1", "true", "yes", "debug"})
 
-env   = MazeEnvironment(MAZE_PATH, rotate_fire=True)
-agent = MazeAgent()
-agent.goal_pos = env.goal_cell
-agent.epsilon = 0.0
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--maze", default="/mnt/data/MAZE_1.png")
+    parser.add_argument("--templates", default="templates")
+    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--max-turns", type=int, default=10_000)
+    parser.add_argument("--rotate-fire", action="store_true")
+    parser.add_argument("--model", default="fresh_agent.pkl")
+    parser.add_argument("--delay", type=float, default=0.05)
+    args = parser.parse_args()
 
-agent.known = {}
-agent.wall_edges = set()
-agent.open_edges = set()
+    env = MazeEnvironment(args.maze, templates_dir=args.templates, rotate_fire=args.rotate_fire)
+    agent = FreshMazeAgent()
+    agent.attach_environment(env)
+    agent.load(args.model)
 
-STEP_DELAY = float(sys.argv[4]) if len(sys.argv) > 4 else 0.05
+    viz = LiveVisualizer(env, title="Fresh Maze Solver", delay=args.delay)
+    for ep in range(1, args.episodes + 1):
+        start = env.reset()
+        agent.reset_episode(start)
+        last_result = None
+        path = [start]
 
-if UPDATE_EVERY > 1:
-    print("[run_live] Note: UPDATE_EVERY > 1 can make rotating fire visuals look stale.")
+        for turn in range(1, args.max_turns + 1):
+            actions = agent.plan_turn(last_result)
+            last_result = env.step(actions)
 
-viz = LiveVisualizer(
-    env          = env,
-    title        = f"Maze Agent – {MAZE_PATH}",
-    update_every = UPDATE_EVERY,
-    delay        = STEP_DELAY,
-)
+            if last_result.is_dead:
+                path = [env.start_cell]
+            else:
+                for pos in last_result.positions_visited:
+                    if not path or path[-1] != pos:
+                        path.append(pos)
 
-for ep in range(NUM_EPISODES):
-    pos = env.reset()
-    agent.current_pos = pos
-    agent.start_pos   = pos
-    agent.reset_episode()
-    agent.epsilon = 0.0
-    last_result = None
-    path = [pos]
-    actions_executed_total = 0
-
-    for turn in range(MAX_TURNS):
-        actions     = agent.plan_turn(last_result)
-        result      = env.step(actions)
-        last_result = result
-        actions_executed_total += result.actions_executed
-
-        if DEBUG_HAZARDS and (result.teleported or result.is_dead or result.is_confused or result.wall_hits > 0):
-            print(
-                f"[live] turn={env.turn_count} pos={result.current_position} "
-                f"event={result.last_event or '-'} teleported={result.teleported} "
-                f"dead={result.is_dead} confused={result.is_confused} wall_hits={result.wall_hits} "
-                f"actions={[a.name for a in actions]} visited={result.positions_visited}"
+            viz.update(
+                known_cells=agent.known_cells,
+                current_pos=last_result.current_position,
+                path=path,
+                episode=ep,
+                turn=turn,
+                start_pos=env.start_cell,
+                goal_pos=env.goal_cell,
+                extra_stats={
+                    "pos": last_result.current_position,
+                    "deaths": env.death_count,
+                    "teleports": env.teleport_count,
+                    "confused": env.confused_count,
+                    "explored": len(env.cells_explored),
+                    "event": last_result.last_event or "—",
+                },
             )
 
-        if result.is_dead:
-            path = [agent.start_pos or result.current_position]
+            if last_result.is_goal_reached:
+                print(f"Episode {ep}: SUCCESS in {turn} turns")
+                break
         else:
-            for pos in result.positions_visited:
-                if not path or path[-1] != pos:
-                    path.append(pos)
+            print(f"Episode {ep}: timeout")
 
-        viz.update(
-            known       = agent.known,
-            current_pos = result.current_position,
-            path        = path,
-            episode     = ep + 1,
-            turn        = env.turn_count,
-            goal_pos    = agent.goal_pos,
-            start_pos   = agent.start_pos,
-            extra_stats = {
-                "pos":        str(result.current_position),
-                "turns":      env.turn_count,
-                "actions":    actions_executed_total,
-                "last batch": len(actions),
-                "deaths":     env.death_count,
-                "teleports":  env.teleport_count,
-                "confused":   env.confused_count,
-                "explored":   len(env.cells_explored),
-                "ε":          f"{agent.epsilon:.3f}",
-                "event":      result.last_event or "—",
-            },
-        )
+        time.sleep(1.0)
+        viz.reset_episode()
 
-        if result.is_goal_reached:
-            print(f"Episode {ep+1}: SUCCESS in {env.turn_count} turns "
-                  f"({actions_executed_total} actions)")
-            break
-    else:
-        print(f"Episode {ep+1}: timeout after {MAX_TURNS} turns")
+    viz.close()
 
-    # Pause so you can see the final state, then clear for next episode
-    import time; time.sleep(1.5)
-    viz.reset_episode()
 
-viz.close()
-print("Done.")
+if __name__ == "__main__":
+    main()

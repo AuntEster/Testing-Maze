@@ -1,64 +1,48 @@
-from hazardDemo import MazeEnvironment
-from agent import MazeAgent
 
-MAX_EPISODES = 500
-MAX_TURNS    = 10_000
-MAZE_PATH    = "maze-alpha/MAZE_1.png"
+from __future__ import annotations
 
-env   = MazeEnvironment(MAZE_PATH)
-agent = MazeAgent()
+import argparse
 
-successes = 0
+from agent import FreshMazeAgent
+from core import MazeEnvironment
 
-for ep in range(MAX_EPISODES):
-    pos = env.reset()
-    agent.current_pos = pos
-    agent.start_pos   = pos
-    agent.goal_pos    = env.goal_cell
-    agent.reset_episode()
-    last_result = None
 
-    for turn in range(MAX_TURNS):
-        old_pos   = agent.current_pos
-        old_state = agent.state()
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--maze", default="/mnt/data/MAZE_1.png")
+    parser.add_argument("--templates", default="templates")
+    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--max-turns", type=int, default=10_000)
+    parser.add_argument("--rotate-fire", action="store_true")
+    parser.add_argument("--save", default="fresh_agent.pkl")
+    args = parser.parse_args()
 
-        actions = agent.plan_turn(last_result)
-        result  = env.step(actions)
+    env = MazeEnvironment(args.maze, templates_dir=args.templates, rotate_fire=args.rotate_fire)
+    agent = FreshMazeAgent()
+    agent.attach_environment(env)
 
-        reward    = agent.compute_reward(result, old_pos)
-        new_state = agent.state()
-        agent.update_q(old_state, actions[0], reward, new_state)
+    successes = 0
+    for ep in range(1, args.episodes + 1):
+        start = env.reset()
+        agent.reset_episode(start)
+        last_result = None
 
-        last_result = result
+        for turn in range(1, args.max_turns + 1):
+            actions = agent.plan_turn(last_result)
+            last_result = env.step(actions)
+            if last_result.is_goal_reached:
+                successes += 1
+                print(
+                    f"Ep {ep:>3}: SUCCESS in {turn:>5} turns | "
+                    f"known={len(agent.known_cells)} | wins={successes}"
+                )
+                break
+        else:
+            print(f"Ep {ep:>3}: timeout          | known={len(agent.known_cells)}")
 
-        if result.is_goal_reached:
-            agent.goal_pos = env.goal_cell
-            successes += 1
-            print(f"Ep {ep+1:>3}: SUCCESS in {turn+1:>5} turns | "
-                  f"ε={agent.epsilon:.3f} | "
-                  f"known={len(agent.known)} cells | "
-                  f"cumulative wins={successes}")
-            break
+    agent.save(args.save)
+    print(f"Saved trained agent to {args.save}")
 
-        if env.death_count > 200:
-            print(f"Ep {ep+1:>3}: ABORT (deaths={env.death_count}) | "
-                  f"turn={turn+1} | "
-                  f"ε={agent.epsilon:.3f} | "
-                  f"pos={agent.current_pos} | "
-                  f"goal={'known' if agent.goal_pos else 'NOT found'} | "
-                  f"explored={len(env.cells_explored)}")
-            break
 
-        if turn == MAX_TURNS - 1:
-            goal_known = agent.goal_pos is not None
-            if goal_known:
-                dist = abs(agent.current_pos[0]-agent.goal_pos[0]) + abs(agent.current_pos[1]-agent.goal_pos[1])
-                reason = f"goal known @ {agent.goal_pos}, dist={dist}, deaths={env.death_count}, explored={len(env.cells_explored)}"
-            else:
-                reason = f"goal NOT found, deaths={env.death_count}, explored={len(env.cells_explored)}"
-            print(f"Ep {ep+1:>3}: TIMEOUT          | "
-                  f"ε={agent.epsilon:.3f} | "
-                  f"known={len(agent.known)} cells | {reason}")
-
-agent.save("agent.pkl")
-print(f"\nTraining complete.  Total successes: {successes}/{MAX_EPISODES}")
+if __name__ == "__main__":
+    main()
