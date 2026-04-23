@@ -81,6 +81,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             "teleport_purple":  list(map(list, env.loader.teleport_purple)),
             "teleport_orange":  list(map(list, env.loader.teleport_orange)),
             "teleport_green":   list(map(list, env.loader.teleport_green)),
+            "teleport_red":     list(map(list, getattr(env.loader, "teleport_red", []))),
             "cell_size":        env.CELL_SIZE,
             "fire_rot_idx":     getattr(env, "_fire_rot_idx", 0),
         })
@@ -110,10 +111,12 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             # Collective pit memory: once any agent dies on a fire pit, all
             # subsequent agents this generation start knowing about it.
             # Knowledge still comes from real deaths — spec compliant (SS4.1.2).
-            gen_shared_pits:  set = set(self.persistent_pits)
-            gen_shared_walls: set = set(self.persistent_walls)
+            gen_shared_pits:       set  = set(self.persistent_pits)
+            gen_shared_walls:      set  = set(self.persistent_walls)
+            gen_shared_teleports:  dict = dict(self.persistent_teleports)
 
             for i, ctrl in enumerate(self.population):
+                _is_immigrant = i in getattr(self, "_immigrant_indices", set())
                 fit, ep_agent = evaluate_fitness(
                     ctrl, env,
                     goal_cell=ma.GOAL_CELL, start_cell=ma.START_CELL,
@@ -121,6 +124,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                     epsilon=epsilon, persist=persist,
                     seed_pits=gen_shared_pits,
                     seed_walls=gen_shared_walls,
+                    seed_teleports=None if _is_immigrant else gen_shared_teleports,
                     phase=self.phase, step_q=None,
                 )
                 self.fitness[i] = fit
@@ -131,11 +135,13 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
                 # Accumulate pit AND wall discoveries for remaining agents
                 if persist and hasattr(ep_agent.memory, '_shared_pits'):
-                    gen_shared_pits  |= ep_agent.memory._shared_pits
-                    gen_shared_walls |= ep_agent.memory._shared_walls
+                    gen_shared_pits        |= ep_agent.memory._shared_pits
+                    gen_shared_walls       |= ep_agent.memory._shared_walls
+                    gen_shared_teleports.update(ep_agent.memory._shared_teleports)
                 else:
                     gen_shared_pits  |= ep_agent.memory.known_pits
                     gen_shared_walls |= ep_agent.memory.known_walls
+                    gen_shared_teleports.update(ep_agent.memory.known_teleports)
 
                 # Cumulative map: every cell ever visited by any agent, ever
                 self.cumulative_cell_set.update(ep_agent.memory.visit_count.keys())
@@ -271,8 +277,9 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             except _queue.Full:
                 pass
 
-            self.persistent_pits  = set(gen_shared_pits)
-            self.persistent_walls = set(gen_shared_walls)
+            self.persistent_pits       = set(gen_shared_pits)
+            self.persistent_walls      = set(gen_shared_walls)
+            self.persistent_teleports  = dict(gen_shared_teleports)
 
             self._maybe_switch_phase(gen_solvers, env=env)
 
@@ -290,8 +297,10 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
             n_immigrants = max(1, int(self.immigrant_frac * self.pop_size))
             inject_start = max(elite_k, self.pop_size - n_immigrants)
+            self._immigrant_indices = set()
             for k in range(self.pop_size - inject_start):
                 new_pop[inject_start + k] = NeuralController(self.layer_sizes)
+                self._immigrant_indices.add(inject_start + k)
 
             self.population = new_pop
             self.mut_sigma  = max(self.min_mut_sigma, self.mut_sigma * self.mut_decay)
@@ -310,6 +319,8 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
     ga.last_recorded_best     = -float("inf")
     ga.persistent_pits        = set()
     ga.persistent_walls       = set()
+    ga.persistent_teleports   = dict()
+    ga._immigrant_indices     = set()   # tagged each gen after pop rebuild
     ga.cumulative_cell_set    = set()   # all cells ever visited by any agent
 
     print(f"[GA]  {ga.pop_size} individuals × "
@@ -323,6 +334,24 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
     weights_file = f"weights_{run_id}.npy"
     alias_file   = f"best_weights_{run_id}.npy"
     print(f"[TRAIN] weights → {weights_file}  (alias → {alias_file})\n")
+
+    # Warm-start: seed population from existing weights + mutations.
+    # Agents inherit navigation skills from a previous maze; they still
+    # need to discover this maze's specific layout from scratch.
+    _init_w = args_dict.get("init_weights")
+    if _init_w:
+        try:
+            import numpy as _np
+            flat = _np.load(_init_w)
+            if flat.size == ga.population[0].num_params:
+                for ind in ga.population:
+                    ind.set_flat_weights(flat.copy())
+                    ga._mutate(ind, mutation_rate=0.15)
+                print(f"[WARM-START] population seeded from {_init_w}")
+            else:
+                print(f"[WARM-START] skipped — param mismatch ({flat.size} vs {ga.population[0].num_params})")
+        except Exception as _e:
+            print(f"[WARM-START] failed: {_e}")
 
     epsilon   = 0.70   # D* Lite handles 70% of turns; NN handles fire timing
     for gen_i in range(args_dict["gens"]):
@@ -387,6 +416,17 @@ def _run_test_direct(args, nav_name: str):
     except Exception as e:
         print(f"[ERROR] {e}"); return
 
+    # Count reachable cells via BFS from start — true navigable maze size
+    from collections import deque as _deque
+    _visited_bfs = {env.start_cell}
+    _bfs_q = _deque([env.start_cell])
+    while _bfs_q:
+        _br, _bc = _bfs_q.popleft()
+        for _nb in env.adj[_br][_bc]:
+            if _nb not in _visited_bfs:
+                _visited_bfs.add(_nb)
+                _bfs_q.append(_nb)
+    _total_passable = len(_visited_bfs)
     print(f"[TEST] maze={args.maze}  start={env.start_cell}  goal={env.goal_cell}")
     print(f"[TEST] {args.test_episodes} episodes  eps=0  (frozen)\n")
 
@@ -400,7 +440,16 @@ def _run_test_direct(args, nav_name: str):
     tp_purple    = [(r, c) for r, c in env.loader.teleport_purple]
     tp_orange    = [(r, c) for r, c in env.loader.teleport_orange]
     tp_green     = [(r, c) for r, c in env.loader.teleport_green]
+    tp_red       = [(r, c) for r, c in getattr(env.loader, "teleport_red", [])]
+    arrow_up     = list(env.arrow_up)
+    arrow_left   = list(env.arrow_left)
     fire_rot     = [0]   # mutable for closure
+    # Fallback: show any teleporter pads the loader colour-missed
+    _tp_shown = set(map(tuple, env.loader.teleport_purple)) \
+              | set(map(tuple, env.loader.teleport_orange))  \
+              | set(map(tuple, env.loader.teleport_green))   \
+              | set(map(tuple, getattr(env.loader, "teleport_red", [])))
+    tp_extra  = [(r,c) for (r,c) in env.teleport_map if (r,c) not in _tp_shown]
 
     def _xy(r, c):
         return (min(c*cs + cs//2, img_w-1), min(r*cs + cs//2, img_h-1))
@@ -413,11 +462,43 @@ def _run_test_direct(args, nav_name: str):
         _pdot(draw, r, c, (0, 0, 0), dr=6)
         _pdot(draw, r, c, (255, 255, 255), dr=4)
 
+
+    def _parrow(draw, r, c, direction):
+        """Draw a small directional arrow at cell (r,c). direction: 'up' or 'left'."""
+        x, y = _xy(r, c)
+        col = (0, 200, 255)  # cyan
+        if direction == 'up':
+            draw.line([(x, y+4), (x, y-4)], fill=col, width=2)
+            draw.line([(x, y-4), (x-3, y-1)], fill=col, width=2)
+            draw.line([(x, y-4), (x+3, y-1)], fill=col, width=2)
+        else:  # left
+            draw.line([(x+4, y), (x-4, y)], fill=col, width=2)
+            draw.line([(x-4, y), (x-1, y-3)], fill=col, width=2)
+            draw.line([(x-4, y), (x-1, y+3)], fill=col, width=2)
+
     def _ppath(draw, path):
-        if len(path) < 2:
-            if path: _pdot(draw, *path[0], (33, 150, 243))
+        if not path:
             return
-        draw.line([_xy(r, c) for r, c in path], fill=(33, 150, 243), width=2)
+        if len(path) == 1:
+            _pdot(draw, *path[0], (33, 150, 243)); return
+        # Break path at teleport jumps (consecutive cells > 2 apart)
+        seg = [path[0]]
+        for i in range(1, len(path)):
+            try: r0, c0 = path[i-1][0], path[i-1][1]; r1, c1 = path[i][0], path[i][1]
+            except (TypeError, IndexError): seg.append(path[i]); continue
+            # Not adjacent in maze = teleport or respawn jump
+            if (r1,c1) not in env.adj[r0][c0] and (r0,c0) != (r1,c1):
+                if len(seg) >= 2:
+                    draw.line([_xy(r,c) for r,c in seg], fill=(33,150,243), width=2)
+                elif seg:
+                    _pdot(draw, *seg[0], (33,150,243))
+                seg = [path[i]]
+            else:
+                seg.append(path[i])
+        if len(seg) >= 2:
+            draw.line([_xy(r,c) for r,c in seg], fill=(33,150,243), width=2)
+        elif seg:
+            _pdot(draw, *seg[0], (33,150,243))
 
     _painted   = [maze_pil.copy()]
     _paint_idx = [0]
@@ -436,22 +517,33 @@ def _run_test_direct(args, nav_name: str):
         for r, c in tp_purple: _pdot(draw, r, c, (160, 50, 255), 4)
         for r, c in tp_orange: _pdot(draw, r, c, (255, 140,   0), 4)
         for r, c in tp_green:  _pdot(draw, r, c, ( 30, 200,  70), 4)
+        for r, c in tp_red:    _pdot(draw, r, c, (220,   0, 255), 4)
+        for r, c in tp_extra:  _pdot(draw, r, c, (  0, 220, 220), 4)
+        for r, c in arrow_up:   _parrow(draw, r, c, "up")
+        for r, c in arrow_left: _parrow(draw, r, c, "left")
         _pdot(draw, *env.start_cell, (  0, 230, 100), 6)
         _pdot(draw, *env.goal_cell,  (  0, 220, 255), 7)
         for r, c in known_pits: _pdot(draw, r, c, (180,   0,   0), 4)
         for r, c in (fire_states[fire_rot[0]] if fire_states else []):
             _pdot(draw, r, c, (255, 40, 40), 5)
-        # Death markers — bright yellow skull cross, larger than pit dots
+        # Death markers — skull shape
         for entry in (deaths_list or []):
             dr, dc, dep = entry
             x, y = _xy(dr, dc)
-            hw = 6  # half-width of the X
-            draw.line([x-hw, y-hw, x+hw, y+hw], fill=(255, 230, 0), width=3)
-            draw.line([x+hw, y-hw, x-hw, y+hw], fill=(255, 230, 0), width=3)
-            draw.ellipse([x-hw-1, y-hw-1, x+hw+1, y+hw+1],
-                         outline=(255, 230, 0), width=2)
-            # Episode label next to marker
-            draw.text((x+hw+2, y-hw), str(dep), fill=(255, 230, 0))
+            col = (255, 230, 0)
+            rh = 7  # skull head radius
+            # Cranium
+            draw.ellipse([x-rh, y-rh-1, x+rh, y+rh-3], fill=col)
+            # Eye sockets
+            draw.ellipse([x-5, y-6, x-2, y-3], fill=(0, 0, 0))
+            draw.ellipse([x+2, y-6, x+5, y-3], fill=(0, 0, 0))
+            # Nose
+            draw.ellipse([x-1, y-2, x+1, y],   fill=(0, 0, 0))
+            # Jaw / teeth
+            draw.rectangle([x-rh+1, y+rh-5, x+rh-1, y+rh-3], fill=col)
+            for _tx in [x-4, x, x+4]:
+                draw.rectangle([_tx-1, y+rh-3, _tx+1, y+rh], fill=(0, 0, 0))
+            draw.text((x+rh+2, y-rh), str(dep), fill=col)
         if agent_pos: _pagent(draw, *agent_pos)
         return np.array(disp)
 
@@ -466,7 +558,7 @@ def _run_test_direct(args, nav_name: str):
                            hspace=0.06, wspace=0.20,
                            left=0.02, right=0.97, top=0.93, bottom=0.04)
     ax_map  = fig.add_subplot(gs[0, 0])
-    ax_stat = fig.add_subplot(gs[1, :])
+    ax_stat = fig.add_subplot(gs[1, 0])
     ax_res  = fig.add_subplot(gs[0, 1])
 
     ax_map.axis("off")
@@ -483,42 +575,75 @@ def _run_test_direct(args, nav_name: str):
                              ha="center", va="center", fontsize=9,
                              color="#8ab4d4", fontfamily="monospace")
 
-    def _draw_table(results):
+    def _draw_table(results, metrics=None):
         ax_res.cla(); ax_res.set_facecolor("#060b12"); ax_res.axis("off")
         ax_res.set_title("Test Results", color="#c8d0e0", fontsize=10, pad=4)
         n_k   = args.test_episodes
-        row_h = min(0.09, 0.82 / max(n_k, 1))
-        hdr_y = 0.94
-        cols_x   = [0.03, 0.16, 0.36, 0.52, 0.67, 0.82]
+        row_h = min(0.075, 0.58 / max(n_k, 1))
+        hdr_y = 0.97
+        cols_x   = [0.03, 0.19, 0.40, 0.55, 0.70, 0.85]
         cols_hdr = ["Ep", "Result", "Steps", "Deaths", "Cells", "Fitness"]
         for x, t in zip(cols_x, cols_hdr):
-            ax_res.text(x, hdr_y, t, color="#7a8a9a", fontsize=8.5, va="top",
+            ax_res.text(x, hdr_y, t, color="#7a8a9a", fontsize=8, va="top",
                         fontweight="bold")
-        ax_res.axhline(hdr_y - 0.04, color="#1e2a3a", lw=0.8)
+        ax_res.axhline(hdr_y - 0.03, color="#1e2a3a", lw=0.8)
         for i, r in enumerate(results):
-            y     = hdr_y - 0.09 - i * row_h
+            y     = hdr_y - 0.065 - i * row_h
             color = "#00e5aa" if r["solved"] else "#ff4466"
-            label = "✓ SOLVED" if r["solved"] else ("✗ DEATH" if r.get("died") else "✗ TIMEOUT")
+            label = "✓ SOLVED" if r["solved"] else "✗ TIMEOUT"
             vals  = [str(r["episode"]), label, str(r["turns"]),
                      str(r["deaths"]), str(r["explored"]), f"{r['fitness']:+.0f}"]
             tc    = ["#c8d0e0", color, "#c8d0e0",
                      "#ff9966" if r["deaths"] > 0 else "#c8d0e0",
                      "#c8d0e0", "#c8d0e0"]
             for x, t, col in zip(cols_x, vals, tc):
-                ax_res.text(x, y, t, color=col, fontsize=8.5, va="top")
+                ax_res.text(x, y, t, color=col, fontsize=8, va="top")
+        sy = hdr_y - 0.065 - n_k * row_h - 0.05
         if results:
             n   = len(results)
             n_s = sum(r["solved"]  for r in results)
             at  = sum(r["turns"]   for r in results) / n
             ad  = sum(r["deaths"]  for r in results) / n
             bt  = min((r["turns"] for r in results if r["solved"]), default=None)
-            sy  = hdr_y - 0.09 - n_k * row_h - 0.07
-            ax_res.axhline(sy + 0.03, color="#1e2a3a", lw=0.8)
+            ax_res.axhline(sy + 0.02, color="#1e2a3a", lw=0.8)
             rc  = "#00e5aa" if n_s == n else ("#ffaa00" if n_s > 0 else "#ff4466")
             s   = f"Rate: {n_s}/{n}   Avg steps: {at:.0f}   Avg deaths: {ad:.2f}"
             if bt is not None: s += f"   Best: {bt} steps"
-            ax_res.text(0.03, sy, s, color=rc, fontsize=8.5, va="top",
-                        fontweight="bold")
+            ax_res.text(0.03, sy, s, color=rc, fontsize=8, va="top", fontweight="bold")
+        # ── Metrics panel ────────────────────────────────────────────────────
+        if metrics:
+            my = sy - 0.07
+            ax_res.axhline(my + 0.03, color="#2a3a4a", lw=0.8)
+            my -= 0.01
+            # Required
+            ax_res.text(0.03, my, "REQUIRED METRICS", color="#5a7090",
+                        fontsize=7, va="top", fontweight="bold")
+            my -= 0.055
+            req_rows = [
+                ("Success Rate",         f"{metrics['success_rate']:.1f}%",         "#00e5aa"),
+                ("Avg Path Length",      f"{metrics['avg_path_length']:.0f} cells",  "#c8d0e0"),
+                ("Avg Turns to Solution",f"{metrics['avg_turns_to_sol']:.0f} turns", "#c8d0e0"),
+                ("Death Rate",           f"{metrics['death_rate']:.2f} / ep",         "#ff9966"),
+            ]
+            for lbl, val, col in req_rows:
+                ax_res.text(0.03, my, lbl, color="#8a9aaa", fontsize=7.5, va="top")
+                ax_res.text(0.97, my, val, color=col, fontsize=7.5, va="top", ha="right")
+                my -= 0.048
+            # Bonus
+            my -= 0.01
+            ax_res.text(0.03, my, "BONUS METRICS", color="#5a7090",
+                        fontsize=7, va="top", fontweight="bold")
+            my -= 0.055
+            bon_rows = [
+                ("Exploration Efficiency", f"{metrics['explore_eff']:.4f} cells/turn","#44bbff"),
+                ("Map Completeness",       f"{metrics['map_complete']:.1f}%",          "#44bbff"),
+                ("Replanning Efficiency",  f"{metrics['replan_eff']:.1f}%",            "#44bbff"),
+                ("Learning Efficiency",    f"{metrics['learn_eff']}",                  "#44bbff"),
+            ]
+            for lbl, val, col in bon_rows:
+                ax_res.text(0.03, my, lbl, color="#8a9aaa", fontsize=7.5, va="top")
+                ax_res.text(0.97, my, val, color=col, fontsize=7.5, va="top", ha="right")
+                my -= 0.048
 
     fig.canvas.draw()
     plt.pause(0.05)
@@ -526,10 +651,12 @@ def _run_test_direct(args, nav_name: str):
     # ── Episode loop — mirrors training: evaluate_fitness + accumulated seeds ──
     import queue as _lq
 
-    results         = []
-    death_positions = []
-    seed_pits:  set = set()
-    seed_walls: set = set()
+    results            = []
+    death_positions    = []  # (r, c, ep) cumulative
+    episode_data       = []  # per-episode {path, deaths, agent_pos, seed_pits, result}
+    seed_pits:  set    = set()
+    seed_walls: set    = set()
+    cumulative_explored: set = set()  # unique cells ever visited across all episodes
 
     DISPLAY_EVERY = 100
 
@@ -547,12 +674,19 @@ def _run_test_direct(args, nav_name: str):
             epsilon=0.0, persist=True,
             seed_pits=seed_pits, seed_walls=seed_walls,
             phase=PHASE_OPTIMIZE,
+            early_stop=False,
+            legacy_pit_walls=getattr(args, "legacy_pits", False),
             step_q=step_q, step_interval=DISPLAY_EVERY,
         )
 
         # Accumulate discoveries for next episode
+        # New pits = cells discovered this episode (each = one death location)
+        _new_pits = agent.memory._shared_pits - seed_pits
         seed_pits  |= agent.memory._shared_pits
         seed_walls |= agent.memory._shared_walls
+        cumulative_explored.update(agent.memory.visit_count.keys())
+        for (_dr, _dc) in _new_pits:
+            death_positions.append((_dr, _dc, ep + 1))
 
         ep_stats     = env.get_episode_stats()
         goal_reached = agent.goal_reached
@@ -570,6 +704,15 @@ def _run_test_direct(args, nav_name: str):
             "explored": ep_stats["cells_explored"],
             "fitness":  fit,
             "died":     died and not goal_reached,
+        })
+
+        # Store full per-episode data for navigation (after results.append)
+        episode_data.append({
+            'path':      list(agent.memory.path),
+            'deaths':    list(death_positions),
+            'agent_pos': agent.current_pos,
+            'seed_pits': set(seed_pits),
+            'result':    results[-1],
         })
 
         tag = "✓ SOLVED" if goal_reached else ("✗ DEATH" if died else "✗ TIMEOUT")
@@ -615,9 +758,135 @@ def _run_test_direct(args, nav_name: str):
     if bt is not None: print(f"  Best solve : {bt} steps")
     print("━"*50 + "\n")
 
-    _draw_table(results)
+    # ── Compute all metrics ──────────────────────────────────────────────────
+    solved_r    = [r for r in results if r["solved"]]
+    total_turns = max(sum(r["turns"]  for r in results), 1)
+    total_deaths= sum(r["deaths"] for r in results)
+    n_explored  = len(cumulative_explored)
+
+    avg_path_len    = (sum(r["explored"] for r in solved_r) / len(solved_r)) if solved_r else 0.0
+    avg_turns_sol   = (sum(r["turns"]    for r in solved_r) / len(solved_r)) if solved_r else 0.0
+    explore_eff     = n_explored / total_turns
+    map_complete    = n_explored / max(_total_passable, 1) * 100
+    # Replanning efficiency: clean (0-death) solves as fraction of all solves
+    clean_solves    = sum(1 for r in solved_r if r["deaths"] == 0)
+    replan_eff      = (clean_solves / len(solved_r) * 100) if solved_r else 0.0
+    # Learning efficiency: % improvement in turns from first to last solved ep
+    if len(solved_r) >= 2:
+        learn_eff = f"{(solved_r[0]['turns'] - solved_r[-1]['turns']) / solved_r[0]['turns'] * 100:+.1f}%"
+    elif len(solved_r) == 1:
+        learn_eff = "N/A (1 solve)"
+    else:
+        learn_eff = "N/A (0 solves)"
+
+    metrics = {
+        "success_rate":    n_s / n * 100,
+        "avg_path_length": avg_path_len,
+        "avg_turns_to_sol":avg_turns_sol,
+        "death_rate":      total_deaths / n,
+        "explore_eff":     explore_eff,
+        "map_complete":    map_complete,
+        "replan_eff":      replan_eff,
+        "learn_eff":       learn_eff,
+    }
+
+    # ── Terminal metrics report ───────────────────────────────────────────────
+    print("\n" + "━"*54)
+    print("  PERFORMANCE METRICS")
+    print("━"*54)
+    print("  REQUIRED")
+    print(f"  {'Success Rate':<28}: {n_s}/{n} ({metrics['success_rate']:.1f}%)")
+    print(f"  {'Avg Path Length':<28}: {avg_path_len:.0f} cells (solved eps)")
+    print(f"  {'Avg Turns to Solution':<28}: {avg_turns_sol:.0f} turns")
+    print(f"  {'Death Rate':<28}: {metrics['death_rate']:.2f} deaths/episode")
+    print("  BONUS")
+    print(f"  {'Exploration Efficiency':<28}: {explore_eff:.4f} cells/turn")
+    print(f"  {'Map Completeness':<28}: {map_complete:.1f}% ({n_explored}/{_total_passable} cells)")
+    print(f"  {'Replanning Efficiency':<28}: {replan_eff:.1f}% clean solves")
+    print(f"  {'Learning Efficiency':<28}: {learn_eff}")
+    print("━"*54 + "\n")
+
+    _draw_table(results, metrics)
+
+    # ── Per-episode navigation ─────────────────────────────────────────────
+    # ← → arrow keys to step through episodes; each shows full path + deaths
+    _view_ep = [len(episode_data) - 1]
+
+    def _compose_full(ep_idx):
+        """Paint a complete map for one episode from scratch."""
+        ep   = episode_data[ep_idx]
+        path = ep["path"]
+        img  = maze_pil.copy()
+        draw = _PILDraw.Draw(img)
+        # Draw path with teleport-jump detection
+        if path:
+            seg = [path[0]]
+            for i in range(1, len(path)):
+                try: r0, c0 = path[i-1][0], path[i-1][1]; r1, c1 = path[i][0], path[i][1]
+                except (TypeError, IndexError): seg.append(path[i]); continue
+                # Not adjacent in maze = teleport or respawn jump
+                if (r1,c1) not in env.adj[r0][c0] and (r0,c0) != (r1,c1):
+                    if len(seg) >= 2:
+                        draw.line([_xy(r,c) for r,c in seg], fill=(33,150,243), width=2)
+                    elif seg:
+                        _pdot(draw, *seg[0], (33,150,243))
+                    seg = [path[i]]
+                else:
+                    seg.append(path[i])
+            if len(seg) >= 2:
+                draw.line([_xy(r,c) for r,c in seg], fill=(33,150,243), width=2)
+            elif seg:
+                _pdot(draw, *seg[0], (33,150,243))
+        for r,c in tp_purple: _pdot(draw, r, c, (160, 50,255), 4)
+        for r,c in tp_orange: _pdot(draw, r, c, (255,140,  0), 4)
+        for r,c in tp_green:  _pdot(draw, r, c, ( 30,200, 70), 4)
+        for r,c in tp_red:    _pdot(draw, r, c, (220,  0,255), 4)
+        for r,c in tp_extra:  _pdot(draw, r, c, (  0,220,220), 4)
+        for r,c in arrow_up:   _parrow(draw, r, c, "up")
+        for r,c in arrow_left: _parrow(draw, r, c, "left")
+        _pdot(draw, *env.start_cell, (  0,230,100), 6)
+        _pdot(draw, *env.goal_cell,  (  0,220,255), 7)
+        # Fire pits known at this episode
+        for r,c in ep["seed_pits"]: _pdot(draw, r, c, (180,0,0), 4)
+        # Death markers (skull): yellow = this episode, orange = earlier
+        for (dr,dc,dep) in ep["deaths"]:
+            col = (255,230,0) if dep == ep_idx+1 else (255,140,0)
+            x,y = _xy(dr,dc)
+            rh  = 7
+            draw.ellipse([x-rh, y-rh-1, x+rh, y+rh-3], fill=col)
+            draw.ellipse([x-5,  y-6,    x-2,   y-3],   fill=(0,0,0))
+            draw.ellipse([x+2,  y-6,    x+5,   y-3],   fill=(0,0,0))
+            draw.ellipse([x-1,  y-2,    x+1,   y],     fill=(0,0,0))
+            draw.rectangle([x-rh+1, y+rh-5, x+rh-1, y+rh-3], fill=col)
+            for _tx in [x-4, x, x+4]:
+                draw.rectangle([_tx-1, y+rh-3, _tx+1, y+rh], fill=(0,0,0))
+            draw.text((x+rh+2, y-rh), f"E{dep}", fill=col)
+        if ep["agent_pos"]: _pagent(draw, *ep["agent_pos"])
+        return np.array(img)
+
+    def _navigate(ep_idx):
+        r   = episode_data[ep_idx]["result"]
+        tag = "✓ SOLVED" if r["solved"] else ("✗ DEATH" if r.get("died") else "✗ TIMEOUT")
+        ax_map.set_title(
+            f"Ep {ep_idx+1}/{len(episode_data)}  [{tag}]"
+            f"  steps={r['turns']}  deaths={r['deaths']}"
+            f"  ◄ ► arrows to browse",
+            color="#c8d0e0", fontsize=9, pad=4)
+        im_map.set_data(_compose_full(ep_idx))
+        fig.canvas.draw_idle()
+
+    def _on_key(event):
+        if event.key == "left"  and _view_ep[0] > 0:
+            _view_ep[0] -= 1; _navigate(_view_ep[0])
+        elif event.key == "right" and _view_ep[0] < len(episode_data)-1:
+            _view_ep[0] += 1; _navigate(_view_ep[0])
+
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+    _navigate(_view_ep[0])   # start on last episode
+
     stat_txt.set_text(f"Done  |  rate: {n_s}/{n}  avg: {at:.0f} steps"
-                      f"  avg_d: {ad:.2f}" + (f"  best: {bt}" if bt else ""))
+                      f"  avg_d: {ad:.2f}" + (f"  best: {bt}" if bt else "")
+                      + "   ◄ ► arrows to browse episodes")
     fig.canvas.draw_idle()
     plt.show(block=True)
 
@@ -877,6 +1146,7 @@ def build_and_run(args, navigator_name: str = None):
         "tp_purple":       [],
         "tp_orange":       [],
         "tp_green":        [],
+        "tp_red":          [],
     }
 
     # Persistent painted image — accumulates path across one episode
@@ -911,6 +1181,7 @@ def build_and_run(args, navigator_name: str = None):
         for r,c in _meta["tp_purple"]: _pdot(draw, r, c, (160, 50,255), 4)
         for r,c in _meta["tp_orange"]: _pdot(draw, r, c, (255,140,  0), 4)
         for r,c in _meta["tp_green"]:  _pdot(draw, r, c, ( 30,200, 70), 4)
+        for r,c in _meta["tp_red"]:    _pdot(draw, r, c, (220,  0,255), 4)
 
         # Start / goal
         _pdot(draw, *_meta["start_cell"], (  0,230,100), 6)
@@ -1076,6 +1347,7 @@ def build_and_run(args, navigator_name: str = None):
                     _meta["tp_purple"]   = [tuple(x) for x in last_msg["teleport_purple"]]
                     _meta["tp_orange"]   = [tuple(x) for x in last_msg["teleport_orange"]]
                     _meta["tp_green"]    = [tuple(x) for x in last_msg["teleport_green"]]
+                    _meta["tp_red"]      = [tuple(x) for x in last_msg.get("teleport_red", [])]
                     _reset_painted()
                     state["agent_pos"] = _meta["start_cell"]
 
@@ -1228,6 +1500,10 @@ def main():
     p.add_argument("--persist",  action="store_true")
     p.add_argument("--phase_k",  type=int,   default=3)
     p.add_argument("--run_id",   default=None)
+    p.add_argument("--init_weights", default=None,
+                   help="Warm-start population from these weights + mutations")
+    p.add_argument("--legacy_pits", action="store_true",
+                   help="Re-enable v3 pit-wall seeding (for backward compat)")
     args = p.parse_args()
     build_and_run(args, navigator_name="D* Lite")
 

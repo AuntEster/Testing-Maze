@@ -24,6 +24,7 @@ class TurnResult:
         self.is_goal_reached: bool = False
         self.teleported: bool = False
         self.actions_executed: int = 0
+        self.arrow_pushed: bool = False
 
     def __repr__(self):
         parts = [f"pos={self.current_position}"]
@@ -79,59 +80,28 @@ class MazeEnvironment:
         self.death_pits          = set(map(tuple, self.loader.death_pits))
         # Pass 1 — remove explicit overlap (colour-detected confusion pads)
         self.death_pits         -= self.confusion_pads
-        # Pass 2 — pixel colour analysis.
-        # Fire pit cells contain orange-red flame pixels (R >> G, B low).
-        # Confusion pad cells have a different colour profile.
-        # This works even when confusion pads are adjacent to fire pits.
-        try:
-            import numpy as _np
-            _img_arr = _np.array(Image.open(maze_image_path).convert('RGB'))
-            _CS      = self.CELL_SIZE
-            _pixel_fixed = set()
-            _debug_rows  = []
-            for (_r, _c) in list(self.death_pits):
-                _y1 = _r * _CS + 3
-                _y2 = min((_r + 1) * _CS - 3, _img_arr.shape[0])
-                _x1 = _c * _CS + 3
-                _x2 = min((_c + 1) * _CS - 3, _img_arr.shape[1])
-                _patch = _img_arr[_y1:_y2, _x1:_x2].reshape(-1, 3).astype(_np.float32)
-                # Non-white pixels only (exclude corridor background)
-                _nw = _patch[_patch.max(axis=1) < 230]
-                if len(_nw) < 4:
-                    _pixel_fixed.add((_r, _c)); continue
-                _R, _G, _B = _nw[:, 0], _nw[:, 1], _nw[:, 2]
-                # Fire-like: red dominant, orange hue, low blue
-                _fire_mask = (_R > 140) & (_R > _G * 1.4) & (_B < 120)
-                _frac = float(_fire_mask.sum()) / len(_nw)
-                _mr, _mg, _mb = int(_nw[:,0].mean()), int(_nw[:,1].mean()), int(_nw[:,2].mean())
-                _debug_rows.append((_r, _c, _frac, _mr, _mg, _mb))
-                if _frac < 0.25:
-                    _pixel_fixed.add((_r, _c))
-            self.confusion_pads |= _pixel_fixed
-            self.death_pits     -= _pixel_fixed
-            print(f"[ENV] death_pits={len(self.death_pits)}"
-                  f"  confusion_pads={len(self.confusion_pads)}"
-                  f"  (pixel→confusion: {len(_pixel_fixed)})")
-            # Show the lowest-fire-fraction cells so threshold can be tuned
-            for (_r, _c, _f, _mr, _mg, _mb) in sorted(_debug_rows, key=lambda x: x[2])[:6]:
-                _tag = "→confusion" if (_r, _c) in _pixel_fixed else "fire"
-                print(f"    ({_r:2d},{_c:2d}) fire_frac={_f:.2f}"
-                      f"  avg_rgb=({_mr},{_mg},{_mb})  [{_tag}]")
-        except Exception as _ex:
-            print(f"[ENV] pixel analysis skipped ({_ex}); "
-                  f"death_pits={len(self.death_pits)}"
-                  f"  confusion_pads={len(self.confusion_pads)}") 
+        print(f"[ENV] death_pits={len(self.death_pits)}"
+              f"  confusion_pads={len(self.confusion_pads)}"
+)
+
         self.initial_death_pits  = set(self.death_pits)
         self.fire_clusters = self.group_clusters(self.death_pits, max_gap=3)
         self.initial_fire_clusters = [list(c) for c in self.fire_clusters]
         self._fire_rotation_states = self._precompute_fire_states()
         self._fire_rot_idx = 0
 
+        # Arrow pads (must be before all_hazard_cells)
+        self.arrow_up   = set(map(tuple, getattr(self.loader, "arrow_up",   [])))
+        self.arrow_left = set(map(tuple, getattr(self.loader, "arrow_left", [])))
+        print(f"  arrow_up={len(self.arrow_up)}  arrow_left={len(self.arrow_left)}")
+
         all_hazard_cells = (
             self.death_pits | self.confusion_pads
             | set(map(tuple, self.loader.teleport_purple))
             | set(map(tuple, self.loader.teleport_orange))
             | set(map(tuple, self.loader.teleport_green))
+            | set(map(tuple, getattr(self.loader, "teleport_red", [])))
+            | self.arrow_up | self.arrow_left
         )
         for r, c in all_hazard_cells:
             self.grid[r][c] = True
@@ -139,7 +109,8 @@ class MazeEnvironment:
         self.teleport_map: dict = {}
         for group in [self.loader.teleport_purple,
                       self.loader.teleport_orange,
-                      self.loader.teleport_green]:
+                      self.loader.teleport_green,
+                      getattr(self.loader, "teleport_red", [])]:
             pads = [tuple(p) for p in group]
             for i, pad in enumerate(pads):
                 dest = pads[(i + 1) % len(pads)] if len(pads) > 1 else pad
@@ -157,25 +128,59 @@ class MazeEnvironment:
         # ── BUILD ADJACENCY ───────────────────────────────────────────────────
         self._build_adjacency()
 
+    def _edge_is_open(self, r: int, c: int, nr: int, nc: int) -> bool:
+        """Check a shared cell edge using a band scan instead of one center pixel."""
+        ma     = self.loader.maze_array
+        cell   = self.CELL_SIZE
+        margin = 2
+        min_open = max(6, int((cell - 2 * margin) * 0.6))
+
+        if nr == r + 1 and nc == c:
+            by = min((r + 1) * cell, ma.shape[0] - 1)
+            x0 = c * cell + margin
+            x1 = (c + 1) * cell - margin
+            open_samples = 0
+            total = 0
+            for bx in range(x0, x1):
+                bx = min(max(bx, 0), ma.shape[1] - 1)
+                above = min(max(by - 2, 0), ma.shape[0] - 1)
+                below = min(max(by + 2, 0), ma.shape[0] - 1)
+                total += 1
+                if bool(ma[by, bx]) and bool(ma[above, bx]) and bool(ma[below, bx]):
+                    open_samples += 1
+            return open_samples >= min_open
+
+        if nr == r and nc == c + 1:
+            bx = min((c + 1) * cell, ma.shape[1] - 1)
+            y0 = r * cell + margin
+            y1 = (r + 1) * cell - margin
+            open_samples = 0
+            total = 0
+            for by in range(y0, y1):
+                by = min(max(by, 0), ma.shape[0] - 1)
+                left  = min(max(bx - 2, 0), ma.shape[1] - 1)
+                right = min(max(bx + 2, 0), ma.shape[1] - 1)
+                total += 1
+                if bool(ma[by, bx]) and bool(ma[by, left]) and bool(ma[by, right]):
+                    open_samples += 1
+            return open_samples >= min_open
+
+        return False
+
     # ── Adjacency from boundary pixels ───────────────────────────────────────
     def _build_adjacency(self):
         h  = self.loader.maze_height_cells
         w  = self.loader.maze_width_cells
-        ma = self.loader.maze_array
 
         self.adj = [[set() for _ in range(w)] for _ in range(h)]
         for r in range(h):
             for c in range(w):
                 if r + 1 < h:
-                    by = min((r + 1) * self.CELL_SIZE,                ma.shape[0] - 1)
-                    bx = min(c * self.CELL_SIZE + self.CELL_SIZE // 2, ma.shape[1] - 1)
-                    if ma[by, bx]:
+                    if self._edge_is_open(r, c, r + 1, c):
                         self.adj[r    ][c].add((r + 1, c))
                         self.adj[r + 1][c].add((r,     c))
                 if c + 1 < w:
-                    by = min(r * self.CELL_SIZE + self.CELL_SIZE // 2, ma.shape[0] - 1)
-                    bx = min((c + 1) * self.CELL_SIZE,                 ma.shape[1] - 1)
-                    if ma[by, bx]:
+                    if self._edge_is_open(r, c, r, c + 1):
                         self.adj[r][c    ].add((r, c + 1))
                         self.adj[r][c + 1].add((r, c    ))
 
@@ -347,6 +352,37 @@ class MazeEnvironment:
                 self.agent_pos          = self.teleport_map[self.agent_pos]
                 result.teleported       = True
                 result.current_position = self.agent_pos
+
+            # Arrow pad: force one step in arrow direction, uses full turn
+            if self.agent_pos in self.arrow_up or self.agent_pos in self.arrow_left:
+                _ar, _ac = self.agent_pos
+                _fdr, _fdc = (-1, 0) if self.agent_pos in self.arrow_up else (0, -1)
+                _fnr, _fnc = _ar + _fdr, _ac + _fdc
+                if (_fnr, _fnc) in self.adj[_ar][_ac]:
+                    self.agent_pos = (_fnr, _fnc)
+                    self.cells_explored.add(self.agent_pos)
+                    result.arrow_pushed = True
+                    result.current_position = self.agent_pos
+                    # Full hazard chain on landing cell
+                    if self.agent_pos in self.teleport_map:
+                        self.agent_pos          = self.teleport_map[self.agent_pos]
+                        result.teleported       = True
+                        result.current_position = self.agent_pos
+                    if self.agent_pos in self.confusion_pads:
+                        result.is_confused       = True
+                        self.confused_turns_left = 2
+                        self.confused_count     += 1
+                        currently_confused       = True
+                    if self.agent_pos in self.death_pits:
+                        result.is_dead          = True
+                        self.death_count       += 1
+                        result.current_position = self.agent_pos
+                        self.agent_pos          = self.start_cell
+                    elif self.agent_pos == self.goal_cell:
+                        result.is_goal_reached  = True
+                        self.episode_active     = False
+                # Arrow always uses the full turn regardless of whether push succeeded
+                break
 
             if self.agent_pos in self.confusion_pads:
                 result.is_confused       = True
