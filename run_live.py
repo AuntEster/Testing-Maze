@@ -11,12 +11,13 @@ DEBUG_HAZARDS = (len(sys.argv) > 5 and sys.argv[5].lower() in {"1", "true", "yes
 
 env   = MazeEnvironment(MAZE_PATH, rotate_fire=True)
 agent = MazeAgent()
+agent.load("agent.pkl")
 agent.goal_pos = env.goal_cell
 agent.epsilon = 0.0
+agent.env = env
 
 agent.known = {}
 agent.wall_edges = set()
-agent.open_edges = set()
 
 STEP_DELAY = float(sys.argv[4]) if len(sys.argv) > 4 else 0.05
 
@@ -38,17 +39,15 @@ for ep in range(NUM_EPISODES):
     agent.epsilon = 0.0
     last_result = None
     path = [pos]
-    actions_executed_total = 0
 
     for turn in range(MAX_TURNS):
         actions     = agent.plan_turn(last_result)
         result      = env.step(actions)
         last_result = result
-        actions_executed_total += result.actions_executed
 
         if DEBUG_HAZARDS and (result.teleported or result.is_dead or result.is_confused or result.wall_hits > 0):
             print(
-                f"[live] turn={env.turn_count} pos={result.current_position} "
+                f"[live] turn={turn+1} pos={result.current_position} "
                 f"event={result.last_event or '-'} teleported={result.teleported} "
                 f"dead={result.is_dead} confused={result.is_confused} wall_hits={result.wall_hits} "
                 f"actions={[a.name for a in actions]} visited={result.positions_visited}"
@@ -66,26 +65,22 @@ for ep in range(NUM_EPISODES):
             current_pos = result.current_position,
             path        = path,
             episode     = ep + 1,
-            turn        = env.turn_count,
+            turn        = turn + 1,
             goal_pos    = agent.goal_pos,
             start_pos   = agent.start_pos,
             extra_stats = {
-                "pos":        str(result.current_position),
-                "turns":      env.turn_count,
-                "actions":    actions_executed_total,
-                "last batch": len(actions),
-                "deaths":     env.death_count,
-                "teleports":  env.teleport_count,
-                "confused":   env.confused_count,
-                "explored":   len(env.cells_explored),
-                "ε":          f"{agent.epsilon:.3f}",
-                "event":      result.last_event or "—",
+                "pos":       str(result.current_position),
+                "deaths":    env.death_count,
+                "teleports": env.teleport_count,
+                "confused":  env.confused_count,
+                "explored":  len(env.cells_explored),
+                "ε":         f"{agent.epsilon:.3f}",
+                "event":     result.last_event or "—",
             },
         )
 
         if result.is_goal_reached:
-            print(f"Episode {ep+1}: SUCCESS in {env.turn_count} turns "
-                  f"({actions_executed_total} actions)")
+            print(f"Episode {ep+1}: SUCCESS in {turn+1} turns")
             break
     else:
         print(f"Episode {ep+1}: timeout after {MAX_TURNS} turns")
